@@ -1,0 +1,94 @@
+name: Release YQ
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 18 * * *'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      build: ${{ steps.check-build.outputs.build }}
+    steps:
+      - name: Check Version
+        id: get-version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version=$(curl -s 'https://api.github.com/repos/mikefarah/yq/releases/latest' | jq -r ".tag_name")
+          fi
+          echo "Current Version: ${version}"
+          if [ -z "${version}" ] || [ "${version}" == "null" ]; then
+            echo "Failed to get version"
+            exit 1
+          fi
+          echo "version=${version}" >> $GITHUB_ENV
+          echo "version=${version}" >> $GITHUB_OUTPUT
+
+      - name: Check Build
+        id: check-build
+        run: |
+          gh release view ${version} -R ${{ github.repository }} >/dev/null 2>&1 || echo "build=1" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.outputs.build == '1'
+    env:
+      version: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mikefarah/yq
+          ref: ${{ env.version }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Compile man page markup
+        id: gen-man-page-md
+        run: |
+          ./scripts/generate-man-page-md.sh
+
+      - name: Generate man page
+        uses: docker://pandoc/core:2.14.2
+        id: gen-man-page
+        with:
+          args: >-
+            --standalone
+            --to man
+            --variable=title:"YQ"
+            --variable=section:"1"
+            --variable=header:"yq (https://github.com/mikefarah/yq/) version ${{ env.version }}"
+            --variable=author:"Mike Farah"
+            --output=yq.1
+            man.md
+
+      - name: Get File
+        run: |
+          wget -O ../goreleaser.test https://github.com/${{ github.repository }}/raw/refs/heads/master/.goreleaser.yaml
+
+      - name: Release
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --config ../goreleaser.test --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload man page
+        run: |
+          tar czvf yq_man_page_only.tar.gz yq.1 -C scripts install-man-page.sh
+          gh release upload ${{ env.version }} -R ${{ github.repository }} yq_man_page_only.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
